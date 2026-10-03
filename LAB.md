@@ -354,7 +354,87 @@ Debe devolver la Service Account de la VM.
 
 ## 11. Jenkinsfile
 
-El repositorio ya contiene el `Jenkinsfile`.
+El repositorio contiene el `Jenkinsfile` que ejecuta el pipeline completo.
+
+### Autenticación de Artifact Registry
+
+**Importante:** `gcloud auth configure-docker` debe ejecutarse en el **mismo agente Jenkins** que realiza `docker build` y `docker push`.
+
+El flujo correcto es:
+
+```
+Checkout
+   ↓
+GCP Authentication
+   ↓
+gcloud auth configure-docker
+   ↓
+Docker Build
+   ↓
+Docker Push → Artifact Registry
+   ↓
+Cloud Run Deploy
+```
+
+Ejemplo:
+
+```groovy
+stage('GCP & Docker Auth') {
+    steps {
+        sh """
+            gcloud config set project ${GCP_PROJECT_ID}
+            gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
+        """
+    }
+}
+
+stage('Build and Push Image') {
+    steps {
+        sh """
+            docker build -t ${IMAGE_TAG} .
+            docker push ${IMAGE_TAG}
+        """
+    }
+}
+```
+
+No se debe ejecutar la autenticación dentro de un agente Docker temporal diferente del agente que realizará el `docker push`. De hacerlo, el `~/.docker/config.json` puede quedar dentro del contenedor temporal y no estar disponible para el agente del build/push.
+
+El archivo de Docker de Jenkins debe quedar configurado con el helper de Artifact Registry:
+
+```json
+{
+  "credHelpers": {
+    "us-central1-docker.pkg.dev": "gcloud"
+  }
+}
+```
+
+### Error `Unauthenticated request`
+
+Si el pipeline construye la imagen correctamente pero `docker push` termina con:
+
+```text
+error from registry: Unauthenticated request
+Unauthenticated requests do not have permission "artifactregistry.repositories.uploadArtifacts"
+```
+
+verificar desde la VM:
+
+```bash
+docker exec -it jenkins gcloud auth list
+docker exec -it jenkins gcloud config get-value account
+docker exec -it jenkins gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+docker exec -it jenkins cat /var/jenkins_home/.docker/config.json
+```
+
+La cuenta esperada es:
+
+```text
+jenkins-deployer@sanbox-aldo-prod.iam.gserviceaccount.com
+```
+
+> Si el `docker push` funciona directamente desde la VM pero falla desde Jenkins, revisar primero la configuración de autenticación Docker dentro del agente Jenkins. No es necesario generar una clave JSON para este laboratorio.
 
 El pipeline debe realizar:
 
@@ -362,6 +442,8 @@ El pipeline debe realizar:
 Checkout
    ↓
 GCP Authentication
+   ↓
+gcloud auth configure-docker
    ↓
 Docker Build
    ↓
@@ -376,7 +458,7 @@ La imagen debe utilizar el formato:
 us-central1-docker.pkg.dev/sanbox-aldo-prod/container-repository-gemini-at/gemini-angular-app:<TAG>
 ```
 
-Se recomienda utilizar `BUILD_NUMBER` o el SHA corto del commit como tag.
+Se recomienda utilizar el SHA corto del commit como tag.
 
 ## 12. Configurar Jenkins
 
