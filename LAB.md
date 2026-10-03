@@ -68,6 +68,23 @@ gcloud config set project "$PROJECT_ID"
 
 ## 3. Habilitar APIs
 
+> **Importante:** habilitar APIs es una tarea administrativa y **no debe requerir permisos administrativos para la Service Account de Jenkins**.
+>
+> En este laboratorio existe la Service Account:
+>
+> `jenkins-deployer@sanbox-aldo-prod.iam.gserviceaccount.com`
+>
+> Si `gcloud auth list` muestra esta cuenta como activa y aparece el error `serviceusage.services.enable / AUTH_PERMISSION_DENIED`, cambia temporalmente a una cuenta de usuario con permisos administrativos para habilitar las APIs.
+
+Verificar la identidad activa:
+
+```bash
+gcloud auth list
+gcloud config get-value account
+```
+
+Habilitar las APIs con una cuenta que tenga permisos para administrar Service Usage:
+
 ```bash
 gcloud services enable \
   artifactregistry.googleapis.com \
@@ -76,6 +93,8 @@ gcloud services enable \
   compute.googleapis.com \
   cloudresourcemanager.googleapis.com
 ```
+
+La Service Account de Jenkins **no necesita** `roles/owner` ni `roles/serviceusage.serviceUsageAdmin` para ejecutar el pipeline.
 
 ## 4. Artifact Registry
 
@@ -119,15 +138,25 @@ Guardar el resultado:
 export VM_SERVICE_ACCOUNT="YOUR-SERVICE-ACCOUNT"
 ```
 
-## 6. Permisos IAM
+## 6. Permisos IAM de Jenkins
 
-Para el laboratorio:
+En este laboratorio se utiliza la Service Account dedicada:
+
+```text
+jenkins-deployer@sanbox-aldo-prod.iam.gserviceaccount.com
+```
+
+Definir:
+
+```bash
+export JENKINS_SERVICE_ACCOUNT="jenkins-deployer@sanbox-aldo-prod.iam.gserviceaccount.com"
+```
 
 ### Artifact Registry Writer
 
 ```bash
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$VM_SERVICE_ACCOUNT" \
+  --member="serviceAccount:$JENKINS_SERVICE_ACCOUNT" \
   --role="roles/artifactregistry.writer"
 ```
 
@@ -135,20 +164,31 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 
 ```bash
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:$VM_SERVICE_ACCOUNT" \
+  --member="serviceAccount:$JENKINS_SERVICE_ACCOUNT" \
   --role="roles/run.developer"
 ```
 
 ### Service Account User
 
+Cloud Run necesita que la identidad que realiza el despliegue pueda actuar como la Service Account usada por el servicio de Cloud Run. Para el laboratorio, si se utiliza la misma Service Account como identidad de runtime, puede configurarse:
+
 ```bash
 gcloud iam service-accounts add-iam-policy-binding \
-  "$VM_SERVICE_ACCOUNT" \
-  --member="serviceAccount:$VM_SERVICE_ACCOUNT" \
+  "$JENKINS_SERVICE_ACCOUNT" \
+  --member="serviceAccount:$JENKINS_SERVICE_ACCOUNT" \
   --role="roles/iam.serviceAccountUser"
 ```
 
-> En producción se recomienda utilizar una Service Account dedicada y mínimo privilegio.
+Verificar los permisos:
+
+```bash
+gcloud projects get-iam-policy "$PROJECT_ID" \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:$JENKINS_SERVICE_ACCOUNT" \
+  --format="table(bindings.role)"
+```
+
+> **No otorgar `roles/owner` a Jenkins.** Para producción se recomienda una Service Account dedicada, permisos mínimos y una Service Account separada para el runtime de Cloud Run.
 
 ## 7. Probar Artifact Registry
 
@@ -201,6 +241,8 @@ volumes:
 
 ## 9. Imagen personalizada de Jenkins
 
+El Dockerfile del laboratorio instala **Docker CLI, Docker Compose y Google Cloud CLI**. No instala el Docker daemon porque Jenkins utiliza el socket del Docker Engine del host.
+
 Crear `jenkins/Dockerfile`:
 
 ```dockerfile
@@ -208,22 +250,69 @@ FROM jenkins/jenkins:lts
 
 USER root
 
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    apt-transport-https \
+    git \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg | \
+    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+RUN echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/debian \
+  $(lsb_release -cs) stable" \
+  | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
 RUN apt-get update && \
-    apt-get install -y docker.io curl ca-certificates gnupg && \
+    apt-get install -y docker-ce-cli && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-    | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+# Docker Compose
+RUN mkdir -p /usr/local/lib/docker/cli-plugins/ && \
+    curl -SL \
+    https://github.com/docker/compose/releases/download/v2.26.1/docker-compose-linux-x86_64 \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
+    ln -s /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+# Google Cloud CLI
+RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+    gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
 
 RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] \
-    https://packages.cloud.google.com/apt cloud-sdk main" \
-    > /etc/apt/sources.list.d/google-cloud-sdk.list
+    https://packages.cloud.google.com/apt cloud-sdk main" | \
+    tee /etc/apt/sources.list.d/google-cloud-sdk.list
 
 RUN apt-get update && \
     apt-get install -y google-cloud-cli && \
     rm -rf /var/lib/apt/lists/*
 
+# Permitir que Jenkins use Docker CLI
+RUN groupadd -f docker && \
+    usermod -aG docker jenkins
+
 USER jenkins
+
+# Verificación durante el build
+RUN docker --version && \
+    docker compose version && \
+    gcloud --version
+```
+
+Reconstruir:
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
 
 Reconstruir:
@@ -235,6 +324,18 @@ docker compose up -d
 ```
 
 ## 10. Validar Jenkins
+
+Verificar que las herramientas estén disponibles:
+
+```bash
+docker exec -it jenkins docker --version
+docker exec -it jenkins docker compose version
+docker exec -it jenkins gcloud --version
+```
+
+> El acceso al Docker Engine se obtiene mediante `/var/run/docker.sock`. La autenticación de Google Cloud debe provenir de la identidad configurada para la VM/Jenkins; no se debe guardar una clave JSON dentro de la imagen.
+
+
 
 ```bash
 docker compose ps
@@ -551,4 +652,4 @@ Artifact Registry
 Cloud Run
 ```
 
-La autenticación contra Google Cloud utiliza la identidad de la instancia de Compute Engine, evitando almacenar una clave JSON de Service Account dentro de Jenkins.
+La autenticación contra Google Cloud debe utilizar una identidad administrada por GCP (preferentemente la Service Account asociada a la VM mediante metadata/ADC), evitando almacenar una clave JSON dentro de Jenkins. En este laboratorio la identidad de despliegue prevista es `jenkins-deployer@sanbox-aldo-prod.iam.gserviceaccount.com`. La cuenta utilizada para habilitar APIs puede ser diferente y debe tener permisos administrativos.
